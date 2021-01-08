@@ -1,7 +1,5 @@
 package ru.bitsouth.libs.springstellarauthstarter.services;
 
-import io.jsonwebtoken.Jwts;
-import io.jsonwebtoken.SignatureAlgorithm;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
@@ -15,11 +13,8 @@ import org.stellar.sdk.xdr.XdrDataInputStream;
 import ru.bitsouth.libs.springstellarauthstarter.configuration.StellarAuthConfigurationProperties;
 import shadow.com.google.common.io.BaseEncoding;
 
-import javax.xml.bind.DatatypeConverter;
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
-import java.time.Instant;
-import java.util.Date;
 import java.util.List;
 import java.util.Objects;
 import java.util.concurrent.ThreadLocalRandom;
@@ -28,20 +23,31 @@ import java.util.concurrent.ThreadLocalRandom;
 @Slf4j
 @RequiredArgsConstructor
 @Service
-public class StellarIntegrationService {
+public class StellarAuthService {
     private final StellarAuthConfigurationProperties properties;
     private final Account stellarAccount;
     private final KeyPair stellarServerKeyPair;
+    private final JwtTokenCreator jwtTokenCreator;
 
-    public String getChallenge(String publicKey, String home_domain) {
-        log.info("get challenge for account [{}] and home_domain [{}]", publicKey, home_domain);
-        ManageDataOperation operation = getManageDataOperation(publicKey);
+    public String getChallenge(String publicKey, String homeDomain) {
+        log.info("get challenge for account [{}] and home_domain [{}]", publicKey, homeDomain);
+
+        throwIfWrongHomeDomain(homeDomain);
+
+        ManageDataOperation operation = getManageDataOperation(publicKey, homeDomain, getRandomBytes());
         Transaction transaction = getTransaction(operation);
         transaction.sign(stellarServerKeyPair);
         String base64challenge = transaction.toEnvelopeXdrBase64();
-        log.info("challenge for account [{}] and home_domain [{}] was returned", publicKey, home_domain);
+
+        log.info("challenge for account [{}] and home_domain [{}] was returned", publicKey, homeDomain);
         log.debug("result: {}", base64challenge);
         return base64challenge;
+    }
+
+    private void throwIfWrongHomeDomain(String homeDomain) {
+        if (!homeDomain.endsWith(" auth")) {
+            throw new RuntimeException("Wrong home domain.");
+        }
     }
 
     public String getJwtToken(String transaction) {
@@ -53,14 +59,36 @@ public class StellarIntegrationService {
         byte[] hash = tx.hash();
         List<DecoratedSignature> signatures = tx.getSignatures();
 
-        if (!tx.getSourceAccount().equals(stellarAccount.getAccountId())) {
-            throw new RuntimeException("Invalid source account.");
-        }
+        throwIfInvalidSource(tx);
+        throwIfServerSignatureIsWrong(hash, signatures);
+        throwIfChallengeIsExpired(tx);
+        throwIfThereIsNoManageData(operation);
+        throwIfChallengeHasNoSourceAccount(operation);
+        throwIfClientSignatureIsWrong(operation, hash, signatures);
 
-        if (signatures.stream().anyMatch(x -> !stellarServerKeyPair.verify(hash, x.getSignature().getSignature()))) {
-            throw new RuntimeException("Server signature is missing or invalid.");
-        }
+        return jwtTokenCreator.issue(operation.getSourceAccount(), Util.bytesToHex(hash));
+    }
 
+    private void throwIfClientSignatureIsWrong(Operation operation, byte[] hash, List<DecoratedSignature> signatures) {
+        KeyPair clientKeyPair = KeyPair.fromAccountId(operation.getSourceAccount());
+        if (signatures.stream().allMatch(x -> clientKeyPair.verify(hash, x.getSignature().getSignature()))) {
+            throw new RuntimeException("Client signature is missing or invalid.");
+        }
+    }
+
+    private void throwIfChallengeHasNoSourceAccount(Operation operation) {
+        if (!StringUtils.hasText(operation.getSourceAccount())) {
+            throw new RuntimeException("Challenge has no source account.");
+        }
+    }
+
+    private void throwIfThereIsNoManageData(Operation operation) {
+        if (operation.toXdr().getBody().getDiscriminant() != OperationType.MANAGE_DATA) {
+            throw new RuntimeException("Challenge has no manageData operation.");
+        }
+    }
+
+    private void throwIfChallengeIsExpired(Transaction tx) {
         long now = System.currentTimeMillis() / 1000L;
         if (
                 !(
@@ -71,35 +99,18 @@ public class StellarIntegrationService {
         ) {
             throw new RuntimeException("Challenge transaction expired.");
         }
+    }
 
-        if (operation.toXdr().getBody().getDiscriminant() != OperationType.MANAGE_DATA) {
-            throw new RuntimeException("Challenge has no manageData operation.");
+    private void throwIfServerSignatureIsWrong(byte[] hash, List<DecoratedSignature> signatures) {
+        if (signatures.stream().anyMatch(x -> !stellarServerKeyPair.verify(hash, x.getSignature().getSignature()))) {
+            throw new RuntimeException("Server signature is missing or invalid.");
         }
+    }
 
-        if (!StringUtils.hasText(operation.getSourceAccount())) {
-            throw new RuntimeException("Challenge has no source account.");
+    private void throwIfInvalidSource(Transaction tx) {
+        if (!tx.getSourceAccount().equals(stellarAccount.getAccountId())) {
+            throw new RuntimeException("Invalid source account.");
         }
-
-        log.info("source: {}", operation.getSourceAccount());
-        KeyPair clientKeyPair = KeyPair.fromAccountId(operation.getSourceAccount());
-
-        if (signatures.stream().allMatch(x -> clientKeyPair.verify(hash, x.getSignature().getSignature()))) {
-            throw new RuntimeException("Client signature is missing or invalid.");
-        }
-
-        String jwtToken = Jwts.builder()
-                .setIssuer(properties.getEndpoint())
-                .setSubject(operation.getSourceAccount())
-                .setIssuedAt(toDate(now))
-                .setExpiration(toDate(now + properties.getJwtTokenLifetime()))
-                .setId(toHexString(hash))
-                .signWith(SignatureAlgorithm.HS512, properties.getJwtTokenSecret())
-                .compact();
-
-        log.info("jwt token was returned");
-        log.debug("jwt token: {}", jwtToken);
-
-        return jwtToken;
     }
 
     private Transaction getTx(String transaction) {
@@ -125,19 +136,12 @@ public class StellarIntegrationService {
         return tx;
     }
 
-    private Date toDate(long now) {
-        return Date.from(Instant.ofEpochSecond(now));
-    }
-
-    private String toHexString(byte[] bytes) {
-        return DatatypeConverter.printHexBinary(bytes);
-    }
-
     private Transaction getTransaction(ManageDataOperation operation) {
         Transaction transaction = new Transaction.Builder(
                 stellarAccount, Network.PUBLIC
         )
                 .addOperation(operation)
+
                 .addTimeBounds(TimeBounds.expiresAfter(properties.getChallengeExpireIn()))
                 .setBaseFee(properties.getBaseFee())
                 .build();
@@ -145,11 +149,8 @@ public class StellarIntegrationService {
         return transaction;
     }
 
-    private ManageDataOperation getManageDataOperation(String publicKey) {
-        ManageDataOperation manageDataOperation = new ManageDataOperation.Builder(
-                properties.getManageDataOperationName(),
-                getRandomBytes()
-        )
+    private ManageDataOperation getManageDataOperation(String publicKey, String name, byte[] value) {
+        ManageDataOperation manageDataOperation = new ManageDataOperation.Builder(name, value)
                 .setSourceAccount(publicKey)
                 .build();
         log.debug("operation: {}", manageDataOperation);
@@ -162,8 +163,4 @@ public class StellarIntegrationService {
         return byteArray;
     }
 
-    public String getToml() {
-        return "WEB_AUTH_ACCOUNT=\"" + stellarServerKeyPair.getAccountId() + "\"\n" +
-                "WEB_AUTH_ENDPOINT=\"" + properties.getEndpoint() + "\"";
-    }
 }

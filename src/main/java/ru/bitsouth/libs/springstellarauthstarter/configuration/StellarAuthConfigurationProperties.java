@@ -14,8 +14,6 @@ import javax.validation.constraints.NotNull;
 public class StellarAuthConfigurationProperties {
     @Nullable
     private String serverPrivateKey = "";
-    @NotBlank
-    private String manageDataOperationName = "Sample auth";
     @NotNull
     private Long challengeExpireIn = 300L;
     @NotNull
